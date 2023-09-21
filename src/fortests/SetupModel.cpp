@@ -56,7 +56,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "ohara_rudy_cipa_v1_2017Cvode.hpp"
 #include "paci_hyttinen_aaltosetala_severi_ventricularVersionCvode.hpp"
 #include "ten_tusscher_model_2006_epiCvode.hpp"
-#include "ten_tusscher_model_2006_pints_and_Chons_hERG_ConductanceTaufFitted_istim_gto_dimCvode.hpp"
+#include "tentusscher_2006_pints_and_Chons_hERG_ConductanceTaufFitted_istim_gto_dimCvode.hpp"
 
 SetupModel::SetupModel(const double& rHertz, unsigned modelIndex,
                        boost::shared_ptr<OutputFileHandler> pHandler)
@@ -144,7 +144,7 @@ SetupModel::SetupModel(const double& rHertz, unsigned modelIndex,
                 mpModel.reset(new Cellfaber_rudy_2000FromCellMLCvode(p_solver, p_stimulus));
                 break;
             case 10u:
-                mpModel.reset(new Cellten_tusscher_model_2006_pints_and_Chons_hERG_ConductanceTaufFitted_istim_gto_dimCvode(p_solver, p_stumulus));
+                mpModel.reset(new Celltentusscher_2006_pints_and_Chons_hERG_ConductanceTaufFitted_istim_gto_dimFromCellMLCvode(p_solver, p_stimulus));
                 break;
             default:
                 EXCEPTION("No model matches this index");
