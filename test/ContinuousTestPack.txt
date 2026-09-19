@@ -13,6 +13,8 @@ TestLogisticDistribution.hpp
 TestMakeALookupTable.hpp
 TestMetadataCellmlModels.hpp
 TestParameterBox.hpp
+TestParameterPointSamplesReader.hpp
 TestPkpdReader.hpp
+TestPopulationOfModels.hpp
 TestTorsadePredict.hpp
 TestModelFactory.hpp

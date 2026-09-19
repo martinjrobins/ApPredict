@@ -196,6 +196,20 @@ std::string ApPredictMethods::PrintCommonArguments()
                           "* --brute-force <N>  Make credible intervals with brute force forward simulations,\n"
                           "*                    rather than using lookup tables, and do N samples each time.\n"
                           "*\n"
+                          "* POPULATION OF MODELS:\n"
+                          "* --parameter-samples-file <relative or absolute filepath>\n"
+                          "*   Run a 'population of models'. Provide a file whose first row lists oxmeta\n"
+                          "*   parameter names (space, tab or comma separated), followed by N rows of ABSOLUTE\n"
+                          "*   parameter values (one column per named parameter). Row i defines one virtual cell\n"
+                          "*   (paired rows, NOT a grid). At each concentration all N cells are simulated and the\n"
+                          "*   APD90 (and qNet) are reported as a distribution; the change in APD90 and its credible\n"
+                          "*   intervals are computed per sample against each cell's own control (0 uM) APD90.\n"
+                          "*   Any oxmeta-tagged modifiable parameter may be named (not just channel conductances).\n"
+                          "*   Percentiles default to the 95% interval, or those given by --credible-intervals.\n"
+                          "*   A drug (median dose-response) may be applied on top, but drug UNCERTAINTY\n"
+                          "*   (--*-spread-* or --brute-force) is not compatible and will error. The change in\n"
+                          "*   APD90 is measured against the 0 uM control, which ApPredict always includes.\n"
+                          "*\n"
                           "*\n"
                           "* OTHER OPTIONS:\n"
                           "* --no-downsampling  By default, we print downsampled output to create small action potential\n"
@@ -417,6 +431,7 @@ ApPredictMethods::ApPredictMethods()
       mDrugTwoConcentrationFactor(DOUBLE_UNSET),
       mLookupTableAvailable(false),
       mTwoDrugs(false),
+      mParameterSamplesAvailable(false),
       mPercentiles(std::vector<double>{2.5, 97.5}),
       mConcentrationsFromFile(false),
       mComplete(false),
@@ -477,17 +492,12 @@ ApPredictMethods::ApPredictMethods()
     }
 }
 
-void ApPredictMethods::SetUpLookupTables()
+void ApPredictMethods::ReadPercentilesFromCommandLine()
 {
     CommandLineArguments *p_args = CommandLineArguments::Instance();
 
-    if (!p_args->OptionExists("--credible-intervals"))
-    {
-        // The flag mLookupTableAvailable remains false, and we carry on as normal.
-        return;
-    }
-
-    if (p_args->GetNumberOfArgumentsForOption("--credible-intervals") > 0)
+    if (p_args->OptionExists("--credible-intervals") &&
+        p_args->GetNumberOfArgumentsForOption("--credible-intervals") > 0)
     {
         // Get list of percentiles to use.
         std::vector<double> percentile_ranges = p_args->GetDoublesCorrespondingToOption("--credible-intervals");
@@ -510,6 +520,19 @@ void ApPredictMethods::SetUpLookupTables()
         }
         std::sort(mPercentiles.begin(), mPercentiles.end());
     }
+}
+
+void ApPredictMethods::SetUpLookupTables()
+{
+    CommandLineArguments *p_args = CommandLineArguments::Instance();
+
+    if (!p_args->OptionExists("--credible-intervals"))
+    {
+        // The flag mLookupTableAvailable remains false, and we carry on as normal.
+        return;
+    }
+
+    ReadPercentilesFromCommandLine();
 
     LookupTableLoader lookup_loader(mpModel->GetSystemName(), this->mHertz);
     std::string ideal_table = lookup_loader.GetIdealTable();
@@ -535,6 +558,101 @@ void ApPredictMethods::SetUpLookupTables()
         WriteMessageToFile("CredibleIntervals: Your simulation required the lookup table " + ideal_table + " to create credible intervals, but it was not available so continued without them.");
         mLookupTableAvailable = false;
     }
+}
+
+void ApPredictMethods::SetUpParameterSamples()
+{
+    CommandLineArguments *p_args = CommandLineArguments::Instance();
+
+    if (!p_args->OptionExists("--parameter-samples-file"))
+    {
+        // The flag mParameterSamplesAvailable remains false, and we carry on as normal.
+        return;
+    }
+
+    // Load the pre-sampled parameter values from file.
+    FileFinder samples_file(
+        p_args->GetStringCorrespondingToOption("--parameter-samples-file"),
+        RelativeTo::AbsoluteOrCwd);
+    if (!samples_file.IsFile())
+    {
+        EXCEPTION("The parameter samples file '"
+                  << samples_file.GetAbsolutePath()
+                  << "' does not exist. Please give a relative or absolute path.");
+    }
+    mpParameterSamplesReader = boost::shared_ptr<ParameterPointSamplesReader>(
+        new ParameterPointSamplesReader(samples_file));
+
+    // Validate that the model exposes each named parameter (or its scaling factor variant),
+    // and cache the resolved name plus whether it is one of the drug-block channels.
+    const std::vector<std::string> &r_names = mpParameterSamplesReader->rGetParameterNames();
+    mSampledParameterNames.clear();
+    mSampledParameterChannelIndex.clear();
+    for (unsigned p = 0; p < r_names.size(); p++)
+    {
+        std::string resolved_name;
+        if (mpModel->HasParameter(r_names[p]))
+        {
+            resolved_name = r_names[p];
+        }
+        else if (mpModel->HasParameter(r_names[p] + "_scaling_factor"))
+        {
+            resolved_name = r_names[p] + "_scaling_factor";
+        }
+        else
+        {
+            EXCEPTION(mpModel->GetSystemName()
+                      << " does not have '" << r_names[p] << "' (or '" << r_names[p]
+                      << "_scaling_factor') labelled; cannot use it in the parameter samples file. "
+                         "Please tag it in the CellML file if it is present.");
+        }
+        mSampledParameterNames.push_back(resolved_name);
+
+        // Work out whether this parameter is one of the drug-block channels, so drug block
+        // can be applied on top of the sampled baseline rather than overwriting it.
+        int channel_index = -1;
+        for (unsigned c = 0; c < mMetadataNames.size(); c++)
+        {
+            if (mMetadataNames[c] == r_names[p] || mMetadataNames[c] + "_scaling_factor" == resolved_name)
+            {
+                channel_index = (int)c;
+                break;
+            }
+        }
+        mSampledParameterChannelIndex.push_back(channel_index);
+    }
+
+    // Set the percentiles to report (defaults to the 95% interval if --credible-intervals
+    // is absent or given without arguments).
+    ReadPercentilesFromCommandLine();
+
+    // Guard-rails: the population of models is the sole source of credible intervals in this
+    // mode, so reject any option that actively requests drug-response uncertainty.
+    if (p_args->OptionExists("--brute-force"))
+    {
+        EXCEPTION("--parameter-samples-file cannot be combined with --brute-force: the "
+                  "population of models is the source of the credible intervals, so drug "
+                  "uncertainty sampling is not supported at the same time.");
+    }
+    for (unsigned c = 0; c < mShortNames.size(); c++)
+    {
+        std::vector<std::string> channels;
+        channels.push_back(mShortNames[c]);
+        channels.push_back("drug-two-" + mShortNames[c]);
+        for (unsigned d = 0; d < channels.size(); d++)
+        {
+            if (p_args->OptionExists("--pic50-spread-" + channels[d]) ||
+                p_args->OptionExists("--hill-spread-" + channels[d]))
+            {
+                EXCEPTION("--parameter-samples-file cannot be combined with drug 'spread' "
+                          "options (e.g. --pic50-spread-" + channels[d] + "): the population "
+                          "of models is the source of the credible intervals, so drug "
+                          "uncertainty is not supported at the same time.");
+            }
+        }
+    }
+
+    mParameterSamplesAvailable = true;
 }
 
 void ApPredictMethods::CalculateDoseResponseParameterSamples(
@@ -914,6 +1032,208 @@ void ApPredictMethods::GetCredibleIntervalSamplesForThisConcentration(
     std::cout << "done." << std::endl;
 }
 
+bool ApPredictMethods::RunParameterSamplesForThisConcentration(
+    const unsigned concIndex,
+    const std::vector<double>& rMedianIc50,
+    const std::vector<double>& rMedianHill,
+    const std::vector<double>& rMedianSaturation,
+    const std::vector<double>& rMedianIc50DrugTwo,
+    const std::vector<double>& rMedianHillDrugTwo,
+    const std::vector<double>& rMedianSaturationDrugTwo,
+    double& rApd90, double& rApd50, double& rUpstroke, double& rPeak,
+    double& rPeakTime, double& rCaMax, double& rCaMin, OdeSolution& rMedianSolution)
+{
+    const unsigned num_samples = mpParameterSamplesReader->GetNumSamples();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    // Reset every cell (at every concentration) to a single common baseline state, captured
+    // once on the first call. This makes each concentration's population comparable, so that
+    // the per-sample change in APD90 with no drug is identically zero.
+    if (mPopulationBaselineStateVariables.empty())
+    {
+        mPopulationBaselineStateVariables = mpModel->GetStdVecStateVariables();
+    }
+    const std::vector<double>& state_vars = mPopulationBaselineStateVariables;
+
+    // A helper to apply sample s to the model: set the non-channel parameters directly, and
+    // route the sampled channel conductances through ApplyDrugBlock (so any drug is applied on
+    // top of the per-cell baseline). Non-sampled channels keep their default conductance.
+    auto apply_sample = [&](unsigned s)
+    {
+        std::vector<double> sample_conductances = mDefaultConductances;
+        for (unsigned p = 0; p < mSampledParameterNames.size(); p++)
+        {
+            const double value = mpParameterSamplesReader->rGetSamplesForParameter(p)[s];
+            const int chan = mSampledParameterChannelIndex[p];
+            if (chan < 0)
+            {
+                mpModel->SetParameter(mSampledParameterNames[p], value);
+            }
+            else
+            {
+                sample_conductances[(unsigned)chan] = value;
+            }
+        }
+        for (unsigned channel_idx = 0; channel_idx < mMetadataNames.size(); channel_idx++)
+        {
+            if (mTwoDrugs)
+            {
+                ApplyDrugBlock(mpModel, channel_idx, sample_conductances[channel_idx],
+                               mConcs[concIndex],
+                               rMedianIc50[channel_idx], rMedianHill[channel_idx], rMedianSaturation[channel_idx],
+                               rMedianIc50DrugTwo[channel_idx], rMedianHillDrugTwo[channel_idx], rMedianSaturationDrugTwo[channel_idx]);
+            }
+            else
+            {
+                ApplyDrugBlock(mpModel, channel_idx, sample_conductances[channel_idx],
+                               mConcs[concIndex], rMedianIc50[channel_idx],
+                               rMedianHill[channel_idx], rMedianSaturation[channel_idx]);
+            }
+        }
+    };
+
+    // A helper to turn a sorted vector into the requested percentiles (mirrors the logic used
+    // for the lookup-table/brute-force credible intervals).
+    auto percentiles_of = [&](const std::vector<double>& sorted)
+    {
+        std::vector<double> out(mPercentiles.size(), nan);
+        const unsigned n = sorted.size();
+        if (n == 0u)
+        {
+            return out;
+        }
+        for (unsigned i = 0; i < mPercentiles.size(); i++)
+        {
+            unsigned index;
+            if (mPercentiles[i] < 50)
+            {
+                index = (unsigned)floor(mPercentiles[i] / 100.0 * (double)(n));
+            }
+            else
+            {
+                index = (unsigned)ceil(mPercentiles[i] / 100.0 * (double)(n));
+                if (index >= n)
+                {
+                    index = n - 1u;
+                }
+            }
+            out[i] = sorted[index];
+        }
+        return out;
+    };
+
+    // Run every cell in the population, recording APD90 (and qNet) per sample.
+    std::vector<double> apd90s_this_conc(num_samples, nan);
+    std::vector<double> qnets_this_conc(num_samples, nan);
+
+    const bool suppressing_output = mSuppressOutput;
+    mSuppressOutput = true;
+    for (unsigned s = 0; s < num_samples; s++)
+    {
+        if (!suppressing_output)
+        {
+            std::cout << "Sample " << s + 1 << "/" << num_samples << std::endl;
+        }
+
+        // Reset state variables so each cell starts from the same common baseline point.
+        mpModel->SetStateVariables(state_vars);
+
+        apply_sample(s);
+
+        double apd90, apd50, upstroke, peak, peak_time, ca_max, ca_min;
+        SteadyStatePacingExperiment(mpModel, apd90, apd50, upstroke, peak, peak_time,
+                                    ca_max, ca_min, 0.1 /*ms printing timestep*/, mConcs[concIndex]);
+        if (!DidErrorOccur())
+        {
+            apd90s_this_conc[s] = apd90;
+            if (mCalculateQNet)
+            {
+                CipaQNetCalculator calculator(mpModel);
+                qnets_this_conc[s] = calculator.ComputeQNet();
+            }
+        }
+    }
+    mSuppressOutput = suppressing_output;
+
+    // If this is the control concentration, remember each cell's control APD90 for pairing.
+    if (fabs(mConcs[concIndex]) < 1e-12)
+    {
+        mControlApd90sPerSample = apd90s_this_conc;
+    }
+
+    // Build the raw APD90 (and qNet) credible regions from the surviving cells.
+    std::vector<double> sorted_apd90s;
+    std::vector<double> sorted_qnets;
+    for (unsigned s = 0; s < num_samples; s++)
+    {
+        if (!std::isnan(apd90s_this_conc[s]))
+        {
+            sorted_apd90s.push_back(apd90s_this_conc[s]);
+        }
+        if (mCalculateQNet && !std::isnan(qnets_this_conc[s]))
+        {
+            sorted_qnets.push_back(qnets_this_conc[s]);
+        }
+    }
+    std::sort(sorted_apd90s.begin(), sorted_apd90s.end());
+    std::sort(sorted_qnets.begin(), sorted_qnets.end());
+    mApd90CredibleRegions[concIndex] = percentiles_of(sorted_apd90s);
+    if (mCalculateQNet)
+    {
+        mQNetCredibleRegions[concIndex] = percentiles_of(sorted_qnets);
+    }
+
+    const unsigned num_valid = sorted_apd90s.size();
+    if (num_valid < num_samples)
+    {
+        std::stringstream message;
+        message << (num_samples - num_valid) << " of " << num_samples
+                << " cells in the population failed to produce a valid APD90 at "
+                << mConcs[concIndex] << " uM.";
+        WriteMessageToFile(message.str());
+    }
+
+    // Build the delta-APD90 credible regions, pairing each cell with its OWN control APD90.
+    std::vector<double> deltas;
+    for (unsigned s = 0; s < num_samples; s++)
+    {
+        if (s < mControlApd90sPerSample.size() && !std::isnan(mControlApd90sPerSample[s]) && mControlApd90sPerSample[s] != 0.0 && !std::isnan(apd90s_this_conc[s]))
+        {
+            deltas.push_back(100.0 * (apd90s_this_conc[s] - mControlApd90sPerSample[s]) / mControlApd90sPerSample[s]);
+        }
+    }
+    std::sort(deltas.begin(), deltas.end());
+    mDeltaApd90CredibleRegions[concIndex] = percentiles_of(deltas);
+    mMedianDeltaApd90PerConc[concIndex] = deltas.empty() ? nan : deltas[deltas.size() / 2u];
+
+    // Identify the median-APD90 cell (central line): the surviving cell whose APD90 is the
+    // middle value. We re-run just that one cell to get its full markers and trace for output.
+    unsigned median_sample = 0u;
+    if (num_valid > 0u)
+    {
+        const double median_apd90 = sorted_apd90s[num_valid / 2u];
+        double best_diff = DBL_MAX;
+        for (unsigned s = 0; s < num_samples; s++)
+        {
+            if (!std::isnan(apd90s_this_conc[s]) && fabs(apd90s_this_conc[s] - median_apd90) < best_diff)
+            {
+                best_diff = fabs(apd90s_this_conc[s] - median_apd90);
+                median_sample = s;
+            }
+        }
+    }
+
+    // Re-run the median cell (not suppressed, so warnings behave like a normal run) and leave
+    // the model in its state so the caller's qNet calculation uses the median cell. Start from
+    // the same common baseline so the re-run reproduces the median cell's APD90.
+    mpModel->SetStateVariables(state_vars);
+    apply_sample(median_sample);
+    rMedianSolution = SteadyStatePacingExperiment(mpModel, rApd90, rApd50, rUpstroke, rPeak,
+                                                  rPeakTime, rCaMax, rCaMin,
+                                                  0.1 /*ms printing timestep*/, mConcs[concIndex]);
+    return !DidErrorOccur();
+}
+
 void ApPredictMethods::Run()
 {
     // Make and clean the above directories.
@@ -925,6 +1245,8 @@ void ApPredictMethods::Run()
     mpModel = setup.GetModel();
 
     SetUpLookupTables();
+
+    SetUpParameterSamples();
 
     CommonRunMethod();
 }
@@ -1069,10 +1391,15 @@ void ApPredictMethods::CommonRunMethod()
         this->SetVoltageThresholdForRecordingAsActionPotential(ap_runner.DetectVoltageThresholdForActionPotential());
     }
 
-    CalculateDoseResponseParameterSamples(IC50s, hills);
-    if (mTwoDrugs)
+    // In population-of-models mode the credible intervals come from the sampled parameters,
+    // not from inferred drug-response uncertainty, so skip the dose-response sampling.
+    if (!mParameterSamplesAvailable)
     {
-        CalculateDoseResponseParameterSamples(IC50s_drug_two, hills_drug_two, true);
+        CalculateDoseResponseParameterSamples(IC50s, hills);
+        if (mTwoDrugs)
+        {
+            CalculateDoseResponseParameterSamples(IC50s_drug_two, hills_drug_two, true);
+        }
     }
 
     boost::shared_ptr<const AbstractOdeSystemInformation> p_ode_info = mpModel->GetSystemInformation();
@@ -1115,7 +1442,7 @@ void ApPredictMethods::CommonRunMethod()
     *steady_voltage_results_file << "UpstrokeVelocity(mV/ms)\tPeakVm(mV)\tAPD50(ms)\tAPD90(ms)\t";
 
     // All this is about writing out a nice header line.
-    if (mLookupTableAvailable)
+    if (CredibleIntervalsAvailable())
     {
         for (unsigned i = 0; i < mPercentiles.size(); i++)
         {
@@ -1290,6 +1617,8 @@ void ApPredictMethods::CommonRunMethod()
     bool reliable_credible_intervals = true;
     mApd90CredibleRegions.resize(mConcs.size());
     mQNetCredibleRegions.resize(mConcs.size());
+    mDeltaApd90CredibleRegions.resize(mConcs.size());
+    mMedianDeltaApd90PerConc.resize(mConcs.size());
     double control_apd90 = 0;
     for (unsigned conc_index = 0u; conc_index < mConcs.size(); conc_index++)
     {
@@ -1299,28 +1628,43 @@ void ApPredictMethods::CommonRunMethod()
             std::cout << ",\tDrug 2 Conc = " << mConcs[conc_index] * mDrugTwoConcentrationFactor << "uM";
         std::cout << std::endl; //<< std::flush;
 
-        // Apply drug block on each channel
-        for (unsigned channel_idx = 0; channel_idx < mMetadataNames.size(); channel_idx++)
-        {
-            if (mTwoDrugs)
-            {
-                ApplyDrugBlock(mpModel, channel_idx, mDefaultConductances[channel_idx],
-                               mConcs[conc_index],
-                               median_ic50[channel_idx], median_hill[channel_idx], median_saturation[channel_idx],
-                               median_ic50_drug_two[channel_idx], median_hill_drug_two[channel_idx], median_saturation_drug_two[channel_idx]);
-            }
-            else
-            {
-                ApplyDrugBlock(mpModel, channel_idx, mDefaultConductances[channel_idx],
-                               mConcs[conc_index], median_ic50[channel_idx],
-                               median_hill[channel_idx], median_saturation[channel_idx]);
-            }
-        }
-
         double apd90, apd50, upstroke, peak, peak_time, ca_max, ca_min;
-        OdeSolution solution = SteadyStatePacingExperiment(
-            mpModel, apd90, apd50, upstroke, peak, peak_time, ca_max, ca_min,
-            0.1 /*ms printing timestep*/, mConcs[conc_index]);
+        OdeSolution solution;
+        if (mParameterSamplesAvailable)
+        {
+            // Run the whole population of models at this concentration. The central line
+            // (returned here) is the median-APD90 cell; this call also populates
+            // mApd90CredibleRegions / mQNetCredibleRegions and the per-sample delta regions.
+            RunParameterSamplesForThisConcentration(conc_index,
+                                                    median_ic50, median_hill, median_saturation,
+                                                    median_ic50_drug_two, median_hill_drug_two, median_saturation_drug_two,
+                                                    apd90, apd50, upstroke, peak,
+                                                    peak_time, ca_max, ca_min, solution);
+        }
+        else
+        {
+            // Apply drug block on each channel
+            for (unsigned channel_idx = 0; channel_idx < mMetadataNames.size(); channel_idx++)
+            {
+                if (mTwoDrugs)
+                {
+                    ApplyDrugBlock(mpModel, channel_idx, mDefaultConductances[channel_idx],
+                                   mConcs[conc_index],
+                                   median_ic50[channel_idx], median_hill[channel_idx], median_saturation[channel_idx],
+                                   median_ic50_drug_two[channel_idx], median_hill_drug_two[channel_idx], median_saturation_drug_two[channel_idx]);
+                }
+                else
+                {
+                    ApplyDrugBlock(mpModel, channel_idx, mDefaultConductances[channel_idx],
+                                   mConcs[conc_index], median_ic50[channel_idx],
+                                   median_hill[channel_idx], median_saturation[channel_idx]);
+                }
+            }
+
+            solution = SteadyStatePacingExperiment(
+                mpModel, apd90, apd50, upstroke, peak, peak_time, ca_max, ca_min,
+                0.1 /*ms printing timestep*/, mConcs[conc_index]);
+        }
 
         if (DidErrorOccur())
         {
@@ -1357,7 +1701,12 @@ void ApPredictMethods::CommonRunMethod()
         }
 
         // Populates mApd90CredibleRegions and mQNetCredibleRegions, relies on mApd90s and mQNets.
-        GetCredibleIntervalSamplesForThisConcentration(conc_index, median_saturation, median_saturation_drug_two);
+        // In population-of-models mode this was already done by
+        // RunParameterSamplesForThisConcentration above.
+        if (!mParameterSamplesAvailable)
+        {
+            GetCredibleIntervalSamplesForThisConcentration(conc_index, median_saturation, median_saturation_drug_two);
+        }
 
         if (!DidErrorOccur())
         {
@@ -1367,9 +1716,21 @@ void ApPredictMethods::CommonRunMethod()
                 control_apd90 = apd90;
             }
 
-            // Convert raw APD90 ranked samples into percent change from control
-            double delta_apd90 = 100 * (apd90 - control_apd90) / control_apd90;
+            // Convert raw APD90 ranked samples into percent change from control.
+            // In population-of-models mode the delta and its credible intervals are computed
+            // per-sample (each cell paired with its own control) inside
+            // RunParameterSamplesForThisConcentration, so we read them back here.
+            double delta_apd90;
             std::vector<double> delta_percentiles(mPercentiles.size());
+            if (mParameterSamplesAvailable)
+            {
+                delta_apd90 = mMedianDeltaApd90PerConc[conc_index];
+                delta_percentiles = mDeltaApd90CredibleRegions[conc_index];
+            }
+            else
+            {
+                delta_apd90 = 100 * (apd90 - control_apd90) / control_apd90;
+            }
             if (mLookupTableAvailable)
             {
                 for (unsigned i = 0; i < mPercentiles.size(); i++)
@@ -1383,7 +1744,7 @@ void ApPredictMethods::CommonRunMethod()
                 std::cout << mHertz << "Hz Upstroke velocity = " << upstroke
                           << ", Peak mV = " << peak << ", APD50 = " << apd50
                           << ", APD90 = " << apd90 << ", percent change APD90 = ";
-                if (mLookupTableAvailable)
+                if (CredibleIntervalsAvailable())
                 {
                     std::cout << delta_percentiles[0] << "," << delta_apd90 << ","
                               << delta_percentiles[mPercentiles.size() - 1u]
@@ -1403,7 +1764,7 @@ void ApPredictMethods::CommonRunMethod()
             if (mTwoDrugs) *steady_voltage_results_file << mConcs[conc_index]*mDrugTwoConcentrationFactor << "\t";
             *steady_voltage_results_file << upstroke << "\t" << peak << "\t" << apd50 << "\t" << apd90 << "\t";
 
-            if (mLookupTableAvailable)
+            if (CredibleIntervalsAvailable())
             {
                 for (unsigned i = 0; i < mPercentiles.size(); i++)
                 {
@@ -1418,11 +1779,16 @@ void ApPredictMethods::CommonRunMethod()
                     }
                     // Now add a check to see whether the middle 30% of our credible
                     // interval contains the simulated 'median' answer.
-                    // If not, log it and report a warning later.
-                    const double tolerance_on_percent_change = 1e-2;
-                    if ((mPercentiles[i] < 35 && delta_percentiles[i] > delta_apd90 + tolerance_on_percent_change) || (mPercentiles[i] > 75 && delta_percentiles[i] < delta_apd90 - tolerance_on_percent_change))
+                    // If not, log it and report a warning later. This alignment heuristic
+                    // only applies to lookup-table credible intervals (in population mode the
+                    // median line and the interval come from the same set of samples).
+                    if (mLookupTableAvailable)
                     {
-                        reliable_credible_intervals = false;
+                        const double tolerance_on_percent_change = 1e-2;
+                        if ((mPercentiles[i] < 35 && delta_percentiles[i] > delta_apd90 + tolerance_on_percent_change) || (mPercentiles[i] > 75 && delta_percentiles[i] < delta_apd90 - tolerance_on_percent_change))
+                        {
+                            reliable_credible_intervals = false;
+                        }
                     }
                 }
                 *steady_voltage_results_file << std::endl; // << std::flush;
@@ -1451,7 +1817,7 @@ void ApPredictMethods::CommonRunMethod()
             if (mTwoDrugs) *steady_voltage_results_file << mConcs[conc_index]*mDrugTwoConcentrationFactor << "\t";
             *steady_voltage_results_file << error_code << "\t" << error_code << "\t" << error_code << "\t" << error_code << "\t";
 
-            if (mLookupTableAvailable)
+            if (CredibleIntervalsAvailable())
             {
                 *steady_voltage_results_file << error_code;
                 for (unsigned i = 1; i < mPercentiles.size(); i++)
@@ -1476,7 +1842,7 @@ void ApPredictMethods::CommonRunMethod()
         {
             if (!mSuppressOutput)
             {
-                if (mLookupTableAvailable)
+                if (CredibleIntervalsAvailable())
                 {
                     std::cout << "QNet at " << mConcs[conc_index] << "uM: for lower, median and upper percentiles: "
                               << mQNetCredibleRegions[conc_index][0] << "," << mQNets[conc_index] << ","
@@ -1491,7 +1857,7 @@ void ApPredictMethods::CommonRunMethod()
             *q_net_results_file << mConcs[conc_index] << "\t";
             if (mTwoDrugs) *q_net_results_file << mConcs[conc_index]*mDrugTwoConcentrationFactor << "\t";
 
-            if (mLookupTableAvailable)
+            if (CredibleIntervalsAvailable())
             {
                 for (unsigned i = 0; i < mPercentiles.size(); i++)
                 {
@@ -1649,11 +2015,11 @@ std::vector<std::vector<double>> ApPredictMethods::GetApd90CredibleRegions(void)
         EXCEPTION("Simulation has not been run - check arguments.");
     }
 
-    if (!mLookupTableAvailable)
+    if (!CredibleIntervalsAvailable())
     {
         EXCEPTION(
-            "There was no Lookup Table available for credible interval "
-            "calculations with these settings.");
+            "There was no Lookup Table (or parameter samples file) available for credible "
+            "interval calculations with these settings.");
     }
 
     return mApd90CredibleRegions;
@@ -1666,14 +2032,31 @@ std::vector<std::vector<double>> ApPredictMethods::GetQNetCredibleRegions(void)
         EXCEPTION("Simulation has not been run - check arguments.");
     }
 
-    if (!mLookupTableAvailable)
+    if (!CredibleIntervalsAvailable())
     {
         EXCEPTION(
-            "There was no Lookup Table available for credible interval "
-            "calculations with these settings.");
+            "There was no Lookup Table (or parameter samples file) available for credible "
+            "interval calculations with these settings.");
     }
 
     return mQNetCredibleRegions;
+}
+
+std::vector<std::vector<double>> ApPredictMethods::GetDeltaApd90CredibleRegions(void)
+{
+    if (!mComplete)
+    {
+        EXCEPTION("Simulation has not been run - check arguments.");
+    }
+
+    if (!mParameterSamplesAvailable)
+    {
+        EXCEPTION(
+            "Delta APD90 credible regions are only calculated per-sample when running a "
+            "population of models with --parameter-samples-file.");
+    }
+
+    return mDeltaApd90CredibleRegions;
 }
 
 void ApPredictMethods::ParameterWrapper(

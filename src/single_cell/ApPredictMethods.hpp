@@ -40,6 +40,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "AbstractCvodeCell.hpp"
 #include "LookupTableGenerator.hpp"
 #include "OutputFileHandler.hpp"
+#include "ParameterPointSamplesReader.hpp"
 #include "PkpdDataStructure.hpp"
 
 /**
@@ -188,6 +189,60 @@ private:
   boost::shared_ptr<AbstractUntemplatedLookupTableGenerator> mpLookupTable;
 
   /**
+   * Whether we are running a "population of models" using a set of pre-sampled
+   * parameter values read from a file (see --parameter-samples-file).
+   */
+  bool mParameterSamplesAvailable;
+
+  /** A reader holding the pre-sampled parameter values read from file. */
+  boost::shared_ptr<ParameterPointSamplesReader> mpParameterSamplesReader;
+
+  /**
+   * The model parameter names being sampled, resolved to the name the model actually
+   * exposes (i.e. either the metadata name, or the '..._scaling_factor' variant).
+   * Ordering matches the columns of #mpParameterSamplesReader.
+   */
+  std::vector<std::string> mSampledParameterNames;
+
+  /**
+   * For each sampled parameter, the index of the corresponding channel in #mMetadataNames
+   * (so drug block can be applied on top of the sampled baseline), or -1 if the parameter
+   * is not one of the drug-block channels.
+   * Ordering matches the columns of #mpParameterSamplesReader.
+   */
+  std::vector<int> mSampledParameterChannelIndex;
+
+  /**
+   * Each surviving cell's APD90 at the control (0 uM) concentration, indexed by sample.
+   * Filled during the control-concentration population run and used to pair per-sample
+   * delta-APD90 calculations at every concentration. NaN entries mark cells that failed
+   * to produce a valid control APD90.
+   */
+  std::vector<double> mControlApd90sPerSample;
+
+  /**
+   * The state variables that every cell in the population is reset to before pacing, so that
+   * each concentration's population starts from the same point (making the change in APD90
+   * with no drug identically zero). Captured once, on the first population run.
+   */
+  std::vector<double> mPopulationBaselineStateVariables;
+
+  /**
+   * The credible regions for the CHANGE in APD90 (delta APD90, as a percentage),
+   * calculated per-sample in "population of models" mode.
+   *
+   * The outer vector loops over concentrations.
+   * At each concentration we have a vector of values for the percentiles in #mPercentiles.
+   */
+  std::vector<std::vector<double>> mDeltaApd90CredibleRegions;
+
+  /**
+   * The central (median of per-sample deltas) delta-APD90 (as a percentage) at each
+   * concentration, used for the median_delta_APD90 output column in population mode.
+   */
+  std::vector<double> mMedianDeltaApd90PerConc;
+
+  /**
      * A vector of pairs used to store the credible regions for APD90s,
      * calculated in the main method if a suitable Lookup Table is present.
      *
@@ -316,6 +371,74 @@ protected:
      */
   void SetUpLookupTables();
 
+  /**
+   * Read the '--credible-intervals' command line argument (if present) and convert the
+   * requested credible interval widths into the percentiles stored in #mPercentiles.
+   *
+   * Shared by #SetUpLookupTables and #SetUpParameterSamples.
+   */
+  void ReadPercentilesFromCommandLine();
+
+  /**
+   * Look for the '--parameter-samples-file' argument and, if present, set up a
+   * "population of models" run: read the pre-sampled parameter values, validate that the
+   * model exposes each named parameter, and enforce the guard-rails against combining this
+   * with drug-uncertainty options.
+   */
+  void SetUpParameterSamples();
+
+  /**
+   * @return whether credible intervals will be produced, either from a lookup table /
+   * brute force drug uncertainty (#mLookupTableAvailable) or a population of models
+   * (#mParameterSamplesAvailable).
+   */
+  bool CredibleIntervalsAvailable() const
+  {
+    return mLookupTableAvailable || mParameterSamplesAvailable;
+  }
+
+  /**
+   * Run the whole population of models at a given concentration.
+   *
+   * Simulates every sampled cell, populates the raw APD90 (and qNet) credible regions in
+   * #mApd90CredibleRegions / #mQNetCredibleRegions, computes the per-sample delta-APD90
+   * credible regions in #mDeltaApd90CredibleRegions (paired against each cell's own control
+   * APD90 in #mControlApd90sPerSample), and returns the central (median-APD90 cell) markers
+   * and action potential trace for output.
+   *
+   * @param concIndex  the index of the concentration (in mConcs).
+   * @param rMedianIc50  the median IC50 for each channel (drug applied on top of each sample).
+   * @param rMedianHill  the median Hill coefficient for each channel.
+   * @param rMedianSaturation  the median saturation level for each channel.
+   * @param rMedianIc50DrugTwo  the median IC50 for each channel for drug two (empty if one drug).
+   * @param rMedianHillDrugTwo  the median Hill for each channel for drug two (empty if one drug).
+   * @param rMedianSaturationDrugTwo  the median saturation for each channel for drug two (empty if one drug).
+   * @param rApd90  (output) the median cell's APD90.
+   * @param rApd50  (output) the median cell's APD50.
+   * @param rUpstroke  (output) the median cell's upstroke velocity.
+   * @param rPeak  (output) the median cell's peak voltage.
+   * @param rPeakTime  (output) the median cell's time of peak voltage.
+   * @param rCaMax  (output) the median cell's maximum calcium.
+   * @param rCaMin  (output) the median cell's minimum calcium.
+   * @param rMedianSolution  (output) the median cell's action potential trace.
+   * @return whether a valid median cell was found (false if every cell failed).
+   */
+  bool RunParameterSamplesForThisConcentration(const unsigned concIndex,
+                                               const std::vector<double>& rMedianIc50,
+                                               const std::vector<double>& rMedianHill,
+                                               const std::vector<double>& rMedianSaturation,
+                                               const std::vector<double>& rMedianIc50DrugTwo,
+                                               const std::vector<double>& rMedianHillDrugTwo,
+                                               const std::vector<double>& rMedianSaturationDrugTwo,
+                                               double& rApd90,
+                                               double& rApd50,
+                                               double& rUpstroke,
+                                               double& rPeak,
+                                               double& rPeakTime,
+                                               double& rCaMax,
+                                               double& rCaMin,
+                                               OdeSolution& rMedianSolution);
+
 public:
   /**
      * This constructor just sets some defaults.
@@ -361,6 +484,12 @@ public:
      * @return The credible regions at #mPercentiles for the QNet predictions
      */
     std::vector<std::vector<double> > GetQNetCredibleRegions(void);
+
+    /**
+     * @return The credible regions at #mPercentiles for the CHANGE in APD90 (delta APD90, as a
+     * percentage), computed per-sample in "population of models" mode.
+     */
+    std::vector<std::vector<double> > GetDeltaApd90CredibleRegions(void);
 
     /**
      * Print commit of ApPredict to std:out.
