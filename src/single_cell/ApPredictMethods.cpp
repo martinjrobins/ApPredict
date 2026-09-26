@@ -33,8 +33,12 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 */
 
+#include <atomic>
+#include <exception>
 #include <fstream>
+#include <mutex>
 #include <numeric> // for std::accumulate
+#include <thread> // for std::thread::hardware_concurrency
 
 // ApPredict includes
 #include "AbstractDataStructure.hpp"
@@ -44,6 +48,7 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "CipaQNetCalculator.hpp"
 #include "DoseCalculator.hpp"
 #include "LookupTableLoader.hpp"
+#include "SingleActionPotentialPrediction.hpp"
 
 // Chaste source includes
 #include "CommandLineArguments.hpp"
@@ -209,6 +214,8 @@ std::string ApPredictMethods::PrintCommonArguments()
                           "*   A drug (median dose-response) may be applied on top, but drug UNCERTAINTY\n"
                           "*   (--*-spread-* or --brute-force) is not compatible and will error. The change in\n"
                           "*   APD90 is measured against the 0 uM control, which ApPredict always includes.\n"
+                          "* --num-threads <N> Number of worker threads used to run the population samples\n"
+                          "*                   in parallel (optional - defaults to 1, i.e. serial).\n"
                           "*\n"
                           "*\n"
                           "* OTHER OPTIONS:\n"
@@ -434,6 +441,7 @@ ApPredictMethods::ApPredictMethods()
       mParameterSamplesAvailable(false),
       mPercentiles(std::vector<double>{2.5, 97.5}),
       mConcentrationsFromFile(false),
+      mNumThreads(1u),
       mComplete(false),
       mCalculateQNet(false)
 {
@@ -625,6 +633,16 @@ void ApPredictMethods::SetUpParameterSamples()
     // Set the percentiles to report (defaults to the 95% interval if --credible-intervals
     // is absent or given without arguments).
     ReadPercentilesFromCommandLine();
+
+    // Number of worker threads for the per-sample loop (defaults to 1 = serial).
+    if (p_args->OptionExists("--num-threads"))
+    {
+        mNumThreads = p_args->GetUnsignedCorrespondingToOption("--num-threads");
+        if (mNumThreads < 1u)
+        {
+            EXCEPTION("--num-threads must be at least 1.");
+        }
+    }
 
     // Guard-rails: the population of models is the sole source of credible intervals in this
     // mode, so reject any option that actively requests drug-response uncertainty.
@@ -1032,6 +1050,18 @@ void ApPredictMethods::GetCredibleIntervalSamplesForThisConcentration(
     std::cout << "done." << std::endl;
 }
 
+void ApPredictMethods::ConfigureRunner(SingleActionPotentialPrediction& rRunner, bool suppressWarnings)
+{
+    // Copy every run setting from this object so the runner behaves identically to 'this'.
+    this->CopyRunParametersTo(rRunner);
+
+    // Screen output is always suppressed during the population loop.
+    rRunner.SuppressOutput();
+
+    // On worker threads warnings are suppressed because the Warnings singleton is not thread-safe;
+    rRunner.SuppressWarnings(suppressWarnings);
+}
+
 bool ApPredictMethods::RunParameterSamplesForThisConcentration(
     const unsigned concIndex,
     const std::vector<double>& rMedianIc50,
@@ -1055,10 +1085,12 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
     }
     const std::vector<double>& state_vars = mPopulationBaselineStateVariables;
 
-    // A helper to apply sample s to the model: set the non-channel parameters directly, and
+    // A helper to apply sample s to the given model: set the non-channel parameters directly, and
     // route the sampled channel conductances through ApplyDrugBlock (so any drug is applied on
     // top of the per-cell baseline). Non-sampled channels keep their default conductance.
-    auto apply_sample = [&](unsigned s)
+    // The model is passed in explicitly so that each worker thread applies the sample to its own
+    // model (rather than the shared #mpModel) when running in parallel.
+    auto apply_sample = [&](boost::shared_ptr<AbstractCvodeCell> pModel, unsigned s)
     {
         std::vector<double> sample_conductances = mDefaultConductances;
         for (unsigned p = 0; p < mSampledParameterNames.size(); p++)
@@ -1067,7 +1099,7 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
             const int chan = mSampledParameterChannelIndex[p];
             if (chan < 0)
             {
-                mpModel->SetParameter(mSampledParameterNames[p], value);
+                pModel->SetParameter(mSampledParameterNames[p], value);
             }
             else
             {
@@ -1078,14 +1110,14 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
         {
             if (mTwoDrugs)
             {
-                ApplyDrugBlock(mpModel, channel_idx, sample_conductances[channel_idx],
+                ApplyDrugBlock(pModel, channel_idx, sample_conductances[channel_idx],
                                mConcs[concIndex],
                                rMedianIc50[channel_idx], rMedianHill[channel_idx], rMedianSaturation[channel_idx],
                                rMedianIc50DrugTwo[channel_idx], rMedianHillDrugTwo[channel_idx], rMedianSaturationDrugTwo[channel_idx]);
             }
             else
             {
-                ApplyDrugBlock(mpModel, channel_idx, sample_conductances[channel_idx],
+                ApplyDrugBlock(pModel, channel_idx, sample_conductances[channel_idx],
                                mConcs[concIndex], rMedianIc50[channel_idx],
                                rMedianHill[channel_idx], rMedianSaturation[channel_idx]);
             }
@@ -1128,29 +1160,111 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
 
     const bool suppressing_output = mSuppressOutput;
     mSuppressOutput = true;
-    for (unsigned s = 0; s < num_samples; s++)
+
+    // Run one sample on the given runner and model, recording its APD90 (and qNet) on success.
+    // Both the serial and parallel paths go through this identical body so they cannot diverge.
+    auto run_one_sample = [&](SingleActionPotentialPrediction& rRunner,
+                              boost::shared_ptr<AbstractCvodeCell> pModel, unsigned s)
     {
-        if (!suppressing_output)
-        {
-            std::cout << "Sample " << s + 1 << "/" << num_samples << std::endl;
-        }
-
         // Reset state variables so each cell starts from the same common baseline point.
-        mpModel->SetStateVariables(state_vars);
-
-        apply_sample(s);
-
-        double apd90, apd50, upstroke, peak, peak_time, ca_max, ca_min;
-        SteadyStatePacingExperiment(mpModel, apd90, apd50, upstroke, peak, peak_time,
-                                    ca_max, ca_min, 0.1 /*ms printing timestep*/, mConcs[concIndex]);
-        if (!DidErrorOccur())
+        pModel->SetStateVariables(state_vars);
+        apply_sample(pModel, s);
+        rRunner.RunSteadyPacingExperiment(mConcs[concIndex]);
+        if (!rRunner.DidErrorOccur())
         {
-            apd90s_this_conc[s] = apd90;
+            apd90s_this_conc[s] = rRunner.GetApd90();
             if (mCalculateQNet)
             {
-                CipaQNetCalculator calculator(mpModel);
-                qnets_this_conc[s] = calculator.ComputeQNet();
+                qnets_this_conc[s] = rRunner.CalculateQNet();
             }
+        }
+    };
+
+    if (mNumThreads <= 1u)
+    {
+        // Serial path (default): one runner on the shared model.
+        SingleActionPotentialPrediction runner(mpModel);
+        ConfigureRunner(runner, false /* keep warnings on the serial path */);
+        for (unsigned s = 0; s < num_samples; s++)
+        {
+            if (!suppressing_output)
+            {
+                std::cout << "Sample " << s + 1 << "/" << num_samples << std::endl;
+            }
+            run_one_sample(runner, mpModel, s);
+        }
+    }
+    else
+    {
+        // Parallel path: run the samples across a pool of worker threads, each with its own model
+        // and its own action potential runner (which carries its own error state). Results are
+        // written into distinct per-sample slots so no locking is needed for the results.
+        const unsigned effective_threads = std::min(mNumThreads, num_samples);
+
+        // Build the worker models and the thread pool once (on the main thread), then reuse them
+        // across every concentration. Building serially on the main thread also pre-warms the
+        // (lazily-initialised) ModelFactory registry, avoiding a construction race in the workers.
+        if (mParallelModels.empty())
+        {
+            for (unsigned t = 0; t < effective_threads; t++)
+            {
+                SetupModel setup(this->mHertz, UNSIGNED_UNSET, mpFileHandler);
+                boost::shared_ptr<AbstractCvodeCell> p_model = setup.GetModel();
+                // Match the stimulus start time applied to #mpModel in CommonRunMethod().
+                boost::static_pointer_cast<RegularStimulus>(p_model->GetStimulusFunction())->SetStartTime(5.0);
+                mParallelModels.push_back(p_model);
+            }
+            mpThreadPool = boost::shared_ptr<ThreadPool>(new ThreadPool(effective_threads));
+        }
+
+        std::atomic<unsigned> next_sample(0u);
+        std::mutex exception_mutex;
+        std::exception_ptr first_exception = nullptr;
+
+        std::vector<std::future<void> > futures;
+        futures.reserve(effective_threads);
+        for (unsigned t = 0; t < effective_threads; t++)
+        {
+            boost::shared_ptr<AbstractCvodeCell> p_worker_model = mParallelModels[t];
+            futures.push_back(mpThreadPool->Enqueue([&, p_worker_model]()
+            {
+                SingleActionPotentialPrediction runner(p_worker_model);
+                ConfigureRunner(runner, true /* Warnings singleton is not thread-safe */);
+
+                while (true)
+                {
+                    const unsigned s = next_sample++;
+                    if (s >= num_samples)
+                    {
+                        break;
+                    }
+                    try
+                    {
+                        run_one_sample(runner, p_worker_model, s);
+                    }
+                    catch (...)
+                    {
+                        // Chaste exceptions must not cross the thread boundary; capture the first
+                        // one and stop this worker pulling further samples.
+                        std::lock_guard<std::mutex> lock(exception_mutex);
+                        if (!first_exception)
+                        {
+                            first_exception = std::current_exception();
+                        }
+                        break;
+                    }
+                }
+            }));
+        }
+
+        // Wait for all workers to finish (this also propagates any exception from a task body).
+        for (std::future<void>& r_future : futures)
+        {
+            r_future.get();
+        }
+        if (first_exception)
+        {
+            std::rethrow_exception(first_exception);
         }
     }
     mSuppressOutput = suppressing_output;
@@ -1227,7 +1341,7 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
     // the model in its state so the caller's qNet calculation uses the median cell. Start from
     // the same common baseline so the re-run reproduces the median cell's APD90.
     mpModel->SetStateVariables(state_vars);
-    apply_sample(median_sample);
+    apply_sample(mpModel, median_sample);
     rMedianSolution = SteadyStatePacingExperiment(mpModel, rApd90, rApd50, rUpstroke, rPeak,
                                                   rPeakTime, rCaMax, rCaMin,
                                                   0.1 /*ms printing timestep*/, mConcs[concIndex]);

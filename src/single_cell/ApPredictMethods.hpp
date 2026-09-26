@@ -42,6 +42,10 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "OutputFileHandler.hpp"
 #include "ParameterPointSamplesReader.hpp"
 #include "PkpdDataStructure.hpp"
+#include "ThreadPool.hpp"
+
+// Forward declaration (used only by reference in the parallel population helper).
+class SingleActionPotentialPrediction;
 
 /**
  * Common code to allow this to be run as a test via cmake and also as a
@@ -278,6 +282,40 @@ private:
      * The default conductances for this model.
      */
   std::vector<double> mDefaultConductances;
+
+  /**
+   * Number of worker threads to use for the "population of models" sample loop
+   * (see --num-threads). Defaults to 1, which runs the loop serially (identical to the
+   * historic behaviour). Values greater than 1 parallelise the per-sample simulations.
+   */
+  unsigned mNumThreads;
+
+  /**
+   * One model instance per worker thread, used to run the population samples in parallel.
+   * Built once (lazily, on the first population run) on the main thread and reused across all
+   * concentrations, so that each thread mutates its own model rather than the shared #mpModel.
+   * Empty when running serially (#mNumThreads == 1).
+   */
+  std::vector<boost::shared_ptr<AbstractCvodeCell> > mParallelModels;
+
+  /**
+   * The thread pool used to run the population samples in parallel. Created once (lazily,
+   * alongside #mParallelModels) and reused across all concentrations. Null when running serially.
+   */
+  boost::shared_ptr<ThreadPool> mpThreadPool;
+
+  /**
+   * Configure an action potential runner used to run one population sample, copying this object's
+   * run settings (via AbstractActionPotentialMethod::CopyRunParametersTo) and suppressing screen
+   * output. Both the serial and the parallel population paths use this so they run each sample
+   * identically.
+   *
+   * @param rRunner  the runner to configure.
+   * @param suppressWarnings  whether to suppress warnings on this runner. The parallel path passes
+   *                          true because the Warnings singleton is not thread-safe; the serial
+   *                          path passes false so per-sample warnings still print as they always did.
+   */
+  void ConfigureRunner(SingleActionPotentialPrediction& rRunner, bool suppressWarnings);
 
 protected:
   /** Whether the simulation completed successfully */

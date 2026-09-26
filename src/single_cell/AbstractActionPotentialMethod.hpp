@@ -261,6 +261,13 @@ public:
     unsigned GetMaxNumPaces();
 
     /**
+     * Copy every action-potential *run setting* from this object onto another runner
+     *
+     * @param rDestination  the runner to copy this object's run settings onto.
+     */
+    void CopyRunParametersTo(AbstractActionPotentialMethod& rDestination) const;
+
+    /**
     * @return  whether an error occurred in the action potential marker
     * evaluation (not simulation itself).
     */

@@ -89,6 +89,29 @@ private:
         return rHandler.GetOutputDirectoryFullPath() + rFileName;
     }
 
+    /** Run a hERG-block population scenario at a given thread count and collect the results. */
+    void RunPopulationScenario(const std::string& rSamplesPath,
+                               unsigned numThreads,
+                               const std::string& rOutputDir,
+                               std::vector<std::vector<double> >& rRawRegions,
+                               std::vector<std::vector<double> >& rDeltaRegions,
+                               std::vector<double>& rApd90s)
+    {
+        std::stringstream args;
+        args << "--model 2 --plasma-concs 0 30 --pacing-max-time 1 --credible-intervals "
+             << "--pic50-herg 5 --num-threads " << numThreads << " "
+             << "--parameter-samples-file " << rSamplesPath;
+        CommandLineArgumentsMocker wrapper(args.str());
+
+        ApPredictMethods methods;
+        methods.SetOutputDirectory(rOutputDir);
+        methods.Run();
+
+        rRawRegions = methods.GetApd90CredibleRegions();
+        rDeltaRegions = methods.GetDeltaApd90CredibleRegions();
+        rApd90s = methods.GetApd90s();
+    }
+
 public:
     /**
      * With no drug, every cell's APD90 is concentration-independent, so the per-sample change
@@ -172,6 +195,45 @@ public:
         const unsigned last = num_concs - 1u;
         TS_ASSERT_LESS_THAN(0.5, deltas[last][0]);
         TS_ASSERT_LESS_THAN(0.0, deltas[last][1]);
+    }
+
+    /**
+     * Running the population in parallel (--num-threads > 1) must give exactly the same results
+     * as running it serially: each cell is independent, samples are read from file (no RNG in the
+     * loop), and the credible regions come from sorted survivors, so worker ordering is irrelevant.
+     */
+    void TestParallelMatchesSerial()
+    {
+        OutputFileHandler handler("TestPopulationOfModels_Parallel");
+        std::string samples_path = WriteHergSamplesFile(handler, "herg_samples.txt");
+
+        // Run the same drug + population scenario serially and with a pool of worker threads.
+        std::vector<std::vector<double> > raw_serial, delta_serial, raw_parallel, delta_parallel;
+        std::vector<double> apd90s_serial, apd90s_parallel;
+
+        RunPopulationScenario(samples_path, 1u, "TestPopulationOfModels_Parallel_serial/",
+                              raw_serial, delta_serial, apd90s_serial);
+        RunPopulationScenario(samples_path, 3u, "TestPopulationOfModels_Parallel_parallel/",
+                              raw_parallel, delta_parallel, apd90s_parallel);
+
+        TS_ASSERT_EQUALS(raw_serial.size(), raw_parallel.size());
+        TS_ASSERT_EQUALS(delta_serial.size(), delta_parallel.size());
+        TS_ASSERT_EQUALS(apd90s_serial.size(), apd90s_parallel.size());
+
+        for (unsigned c = 0; c < raw_serial.size(); c++)
+        {
+            TS_ASSERT_EQUALS(raw_serial[c].size(), raw_parallel[c].size());
+            for (unsigned i = 0; i < raw_serial[c].size(); i++)
+            {
+                TS_ASSERT_DELTA(raw_serial[c][i], raw_parallel[c][i], 1e-9);
+            }
+            TS_ASSERT_EQUALS(delta_serial[c].size(), delta_parallel[c].size());
+            for (unsigned i = 0; i < delta_serial[c].size(); i++)
+            {
+                TS_ASSERT_DELTA(delta_serial[c][i], delta_parallel[c][i], 1e-9);
+            }
+            TS_ASSERT_DELTA(apd90s_serial[c], apd90s_parallel[c], 1e-9);
+        }
     }
 
     /**

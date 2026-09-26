@@ -104,6 +104,21 @@ unsigned AbstractActionPotentialMethod::GetMaxNumPaces()
     return mMaxNumPaces;
 }
 
+void AbstractActionPotentialMethod::CopyRunParametersTo(
+    AbstractActionPotentialMethod& rDestination) const
+{
+    rDestination.mMaxNumPaces = mMaxNumPaces;
+    rDestination.mNoOneToOneCorrespondenceIsError = mNoOneToOneCorrespondenceIsError;
+    rDestination.mAlternansIsError = mAlternansIsError;
+    rDestination.mActionPotentialThreshold = mActionPotentialThreshold;
+    rDestination.mActionPotentialThresholdSetManually = mActionPotentialThresholdSetManually;
+    rDestination.mDefaultParametersApd90 = mDefaultParametersApd90;
+    rDestination.mDefaultParametersTimeOfVMax = mDefaultParametersTimeOfVMax;
+    rDestination.mSuppressOutput = mSuppressOutput;
+    rDestination.mSuppressWarnings = mSuppressWarnings;
+    rDestination.mHertz = mHertz;
+}
+
 void AbstractActionPotentialMethod::Reset() { mRunYet = false; }
 
 void AbstractActionPotentialMethod::SetLackOfOneToOneCorrespondenceIsError(
