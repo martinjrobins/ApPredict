@@ -56,7 +56,8 @@ const std::map<std::string, std::string> SetupModel::modelMapping = { { "1", "sh
                                                                       { "6", "ohara_rudy_2011_endo" },
                                                                       { "7", "paci_hyttinen_aaltosetala_severi_ventricularVersion" },
                                                                       { "8", "ohara_rudy_cipa_v1_2017" },
-                                                                      { "9", "faber_rudy_2000" } };
+                                                                      { "9", "faber_rudy_2000" },
+                                                                      { "10", "tentusscher_2006_pints_and_Chons_hERG_ConductanceTaufFitted_istim_gto_dim" } };
 
 const std::unordered_set<std::string> SetupModel::forceNumericalJModels = { "hund_rudy_2004" };
 
