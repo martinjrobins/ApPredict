@@ -70,20 +70,20 @@ private:
     }
 
     /** Write a samples file scattering the herg conductance around its default, and return the
-     *  path (and the parameter name written in the header). */
+     *  path (and the parameter name written in the header). The sampled values are scaling factors
+     *  (multipliers of the model default), so 1.0 reproduces the default. */
     std::string WriteHergSamplesFile(OutputFileHandler& rHandler, const std::string& rFileName)
     {
         SetupModel setup(1.0, 2u); // ten Tusscher 2006 epi
         boost::shared_ptr<AbstractCvodeCell> p_model = setup.GetModel();
         std::string herg_name = ResolveHergName(p_model);
-        double default_value = p_model->GetParameter(herg_name);
 
         const double factors[5] = { 0.7, 0.85, 1.0, 1.15, 1.3 };
         out_stream p_file = rHandler.OpenOutputFile(rFileName);
         (*p_file) << herg_name << "\n";
         for (unsigned i = 0; i < 5; i++)
         {
-            (*p_file) << default_value * factors[i] << "\n";
+            (*p_file) << factors[i] << "\n";
         }
         p_file->close();
         return rHandler.GetOutputDirectoryFullPath() + rFileName;

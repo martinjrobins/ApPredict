@@ -45,8 +45,9 @@ OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  * The file format is:
  *  * a header line listing the oxmeta parameter names (space, tab or comma separated),
- *  * followed by one row per sample, each row giving one (absolute) value per named
- *    parameter in the same column order as the header.
+ *  * followed by one row per sample, each row giving one value per named parameter in the
+ *    same column order as the header. Values are scaling factors (multipliers of the model's
+ *    default for each parameter), so a value of 1.0 reproduces the model default.
  *
  * Row i across all parameters defines one virtual cell (paired rows), so every row must
  * have exactly as many values as there are parameter names in the header.

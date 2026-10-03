@@ -217,6 +217,17 @@ private:
   std::vector<int> mSampledParameterChannelIndex;
 
   /**
+   * For each sampled parameter, the model's default value of that parameter (captured once,
+   * before any sampling, from the freshly-created model). The sampled values in the file are
+   * interpreted as multipliers of this default, so a sampled value of 1.0 reproduces the
+   * model default. This keeps the semantics consistent for every parameter, whether or not it
+   * is one of the drug-block channels and whether the model's tag defaults to 1.0 or to an
+   * absolute conductance (e.g. ORdCiPA's IKr '..._scaling_factor' default of ~0.0466).
+   * Ordering matches the columns of #mpParameterSamplesReader.
+   */
+  std::vector<double> mSampledParameterDefaults;
+
+  /**
    * Each surviving cell's APD90 at the control (0 uM) concentration, indexed by sample.
    * Filled during the control-concentration population run and used to pair per-sample
    * delta-APD90 calculations at every concentration. NaN entries mark cells that failed

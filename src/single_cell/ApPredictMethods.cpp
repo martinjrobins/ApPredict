@@ -204,11 +204,13 @@ std::string ApPredictMethods::PrintCommonArguments()
                           "* POPULATION OF MODELS:\n"
                           "* --parameter-samples-file <relative or absolute filepath>\n"
                           "*   Run a 'population of models'. Provide a file whose first row lists oxmeta\n"
-                          "*   parameter names (space, tab or comma separated), followed by N rows of ABSOLUTE\n"
-                          "*   parameter values (one column per named parameter). Row i defines one virtual cell\n"
-                          "*   (paired rows, NOT a grid). At each concentration all N cells are simulated and the\n"
-                          "*   APD90 (and qNet) are reported as a distribution; the change in APD90 and its credible\n"
-                          "*   intervals are computed per sample against each cell's own control (0 uM) APD90.\n"
+                          "*   parameter names (space, tab or comma separated), followed by N rows of SCALING\n"
+                          "*   FACTORS (one column per named parameter), i.e. MULTIPLIERS of the model's default\n"
+                          "*   value for that parameter, so a value of 1.0 reproduces the model default. Row i\n"
+                          "*   defines one virtual cell (paired rows, NOT a grid). At each concentration all N\n"
+                          "*   cells are simulated and the APD90 (and qNet) are reported as a distribution; the\n"
+                          "*   change in APD90 and its credible intervals are computed per sample against each\n"
+                          "*   cell's own control (0 uM) APD90.\n"
                           "*   Any oxmeta-tagged modifiable parameter may be named (not just channel conductances).\n"
                           "*   Percentiles default to the 95% interval, or those given by --credible-intervals.\n"
                           "*   A drug (median dose-response) may be applied on top, but drug UNCERTAINTY\n"
@@ -596,6 +598,7 @@ void ApPredictMethods::SetUpParameterSamples()
     const std::vector<std::string> &r_names = mpParameterSamplesReader->rGetParameterNames();
     mSampledParameterNames.clear();
     mSampledParameterChannelIndex.clear();
+    mSampledParameterDefaults.clear();
     for (unsigned p = 0; p < r_names.size(); p++)
     {
         std::string resolved_name;
@@ -615,6 +618,10 @@ void ApPredictMethods::SetUpParameterSamples()
                          "Please tag it in the CellML file if it is present.");
         }
         mSampledParameterNames.push_back(resolved_name);
+
+        // Record the model's default value of this parameter now (before any sampling perturbs
+        // it).
+        mSampledParameterDefaults.push_back(mpModel->GetParameter(resolved_name));
 
         // Work out whether this parameter is one of the drug-block channels, so drug block
         // can be applied on top of the sampled baseline rather than overwriting it.
@@ -1085,9 +1092,11 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
     }
     const std::vector<double>& state_vars = mPopulationBaselineStateVariables;
 
-    // A helper to apply sample s to the given model: set the non-channel parameters directly, and
-    // route the sampled channel conductances through ApplyDrugBlock (so any drug is applied on
-    // top of the per-cell baseline). Non-sampled channels keep their default conductance.
+    // A helper to apply sample s to the given model. Every sampled value is treated as a
+    // multiplier of the model's default for that parameter (so a value of 1.0 reproduces the
+    // default): non-channel parameters are set directly to default*value, and sampled channel
+    // conductances are routed through ApplyDrugBlock as default*value (so any drug block is applied
+    // on top of the per-cell baseline). Non-sampled channels keep their default conductance.
     // The model is passed in explicitly so that each worker thread applies the sample to its own
     // model (rather than the shared #mpModel) when running in parallel.
     auto apply_sample = [&](boost::shared_ptr<AbstractCvodeCell> pModel, unsigned s)
@@ -1099,11 +1108,13 @@ bool ApPredictMethods::RunParameterSamplesForThisConcentration(
             const int chan = mSampledParameterChannelIndex[p];
             if (chan < 0)
             {
-                pModel->SetParameter(mSampledParameterNames[p], value);
+                // Non-channel parameter: the sampled value is a multiplier of the model default
+                pModel->SetParameter(mSampledParameterNames[p], mSampledParameterDefaults[p] * value);
             }
             else
             {
-                sample_conductances[(unsigned)chan] = value;
+                // The sampled value is a multiplier of the model's default conductance
+                sample_conductances[(unsigned)chan] = mDefaultConductances[(unsigned)chan] * value;
             }
         }
         for (unsigned channel_idx = 0; channel_idx < mMetadataNames.size(); channel_idx++)
@@ -1845,7 +1856,10 @@ void ApPredictMethods::CommonRunMethod()
             {
                 delta_apd90 = 100 * (apd90 - control_apd90) / control_apd90;
             }
-            if (mLookupTableAvailable)
+            // In population-of-models mode the per-sample paired delta regions (computed above)
+            // are the correct credible intervals, so only fall back to the unpaired lookup-table
+            // computation when we are NOT running a population of models.
+            if (mLookupTableAvailable && !mParameterSamplesAvailable)
             {
                 for (unsigned i = 0; i < mPercentiles.size(); i++)
                 {
